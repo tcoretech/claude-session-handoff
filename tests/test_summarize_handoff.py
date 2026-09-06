@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,7 +23,11 @@ class SummarizeHandoffTests(unittest.TestCase):
         shutil.copy(FIXTURES / "session_alpha.jsonl", self.session_path)
 
     def tearDown(self) -> None:
-        shutil.rmtree(self.temp_dir)
+        def remove_readonly(function, path, _error) -> None:
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+
+        shutil.rmtree(self.temp_dir, onerror=remove_readonly)
 
     def test_json_handoff_is_structured(self) -> None:
         result = subprocess.run(
