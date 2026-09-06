@@ -20,7 +20,9 @@ The repository ships both
 - Finds recent local Claude sessions
 - Shows a short numbered picker instead of guessing
 - Resolves your choice from a saved snapshot, so the picked number stays stable
-- Summarizes the selected transcript into a compact Codex handoff
+- Keeps discovery payloads out of model context and automatically resolves an explicit request for
+  the latest matching workspace session
+- Summarizes the selected transcript into a bounded compact Codex handoff
 - Separates human prompts from notifications, command wrappers, sidechains, and compaction records
 - Confines inferred files to the active repository and verifies repository metadata with fixed
   read-only checks
@@ -151,10 +153,11 @@ macOS/Linux:
 
 ```bash
 python3 scripts/discover_sessions.py --cwd "$PWD" --limit 5 --picker
-python3 scripts/discover_sessions.py --cwd "$PWD" --limit 5 --json --snapshot-out /tmp/claude-session-handoff-snapshot.json
+python3 scripts/discover_sessions.py --cwd "$PWD" --limit 5 --snapshot-out /tmp/claude-session-handoff-snapshot.json --quiet
 python3 scripts/discover_sessions.py --snapshot-in /tmp/claude-session-handoff-snapshot.json --picker
 python3 scripts/resolve_session_choice.py --snapshot /tmp/claude-session-handoff-snapshot.json --choice 1 --field file_path
-python3 scripts/summarize_handoff.py --session /path/to/session.jsonl --cwd "$PWD" --json
+python3 scripts/resolve_session_choice.py --snapshot /tmp/claude-session-handoff-snapshot.json --latest-repo-match --field file_path
+python3 scripts/summarize_handoff.py --session /path/to/session.jsonl --cwd "$PWD" --compact-json
 ```
 
 Windows PowerShell:
@@ -162,10 +165,11 @@ Windows PowerShell:
 ```powershell
 $snapshot = Join-Path $env:TEMP "claude-session-handoff-snapshot.json"
 py -3 scripts/discover_sessions.py --cwd (Get-Location) --limit 5 --picker
-py -3 scripts/discover_sessions.py --cwd (Get-Location) --limit 5 --json --snapshot-out $snapshot
+py -3 scripts/discover_sessions.py --cwd (Get-Location) --limit 5 --snapshot-out $snapshot --quiet
 py -3 scripts/discover_sessions.py --snapshot-in $snapshot --picker
 py -3 scripts/resolve_session_choice.py --snapshot $snapshot --choice 1 --field file_path
-py -3 scripts/summarize_handoff.py --session C:\path\to\session.jsonl --cwd (Get-Location) --json
+py -3 scripts/resolve_session_choice.py --snapshot $snapshot --latest-repo-match --field file_path
+py -3 scripts/summarize_handoff.py --session C:\path\to\session.jsonl --cwd (Get-Location) --compact-json
 ```
 
 ## How discovery works

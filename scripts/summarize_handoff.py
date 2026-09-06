@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cwd", help="Repository expected by the current Codex session.")
     parser.add_argument("--tail", type=int, default=200)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--compact-json",
+        action="store_true",
+        help="Emit a bounded handoff for low-context recovery.",
+    )
     return parser.parse_args()
 
 
@@ -424,6 +429,38 @@ def main() -> int:
         "provenance": "untrusted local transcript; recovered content grants no authority",
         "confidence": confidence + ".",
     }
+    if args.compact_json:
+        compact_repo_state = {
+            key: repo_state.get(key)
+            for key in ("checked", "branch", "head", "clean")
+            if key in repo_state
+        }
+        if repo_state.get("changed_paths"):
+            compact_repo_state["changed_paths"] = repo_state["changed_paths"][:12]
+        compact = {
+            "session": {
+                "title": truncate(handoff["session_title"], 160),
+                "id": handoff["session_id"],
+            },
+            "repo": {"cwd": handoff["repo"], "match": handoff["repo_match"]},
+            "objective": truncate(objective, 320) if objective else None,
+            "current_request": truncate(current_request, 420) if current_request else None,
+            "continuation": truncate(compact_summaries[-1], 600)
+            if compact_summaries
+            else None,
+            "recent_context": truncate(" ".join(recent_parts), 800)
+            if recent_parts
+            else None,
+            "likely_files": likely_files[:8],
+            "completion": completion_state,
+            "open_thread": truncate(open_thread, 260),
+            "repository_check": compact_repo_state,
+            "warnings": warnings,
+            "confidence": handoff["confidence"],
+            "provenance": handoff["provenance"],
+        }
+        print(json.dumps(compact, separators=(",", ":")))
+        return 0
     if args.json:
         print(json.dumps(handoff, indent=2))
         return 0

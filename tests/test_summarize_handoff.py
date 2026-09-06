@@ -457,6 +457,27 @@ class SummarizeHandoffTests(unittest.TestCase):
         self.assertTrue(payload["repo_state"]["likely_file_exists"][str(tracked)])
         self.assertEqual(payload["repo_match"], "strong")
 
+    def test_compact_json_is_bounded_and_omits_transcript_path(self) -> None:
+        session_path = self.temp_dir / "session-compact.jsonl"
+        long_text = "Context " * 1000
+        entries = [
+            {"sessionId": "session-compact", "cwd": "/workspace/current", "type": "user", "message": {"content": "Review the change"}},
+            {"sessionId": "session-compact", "cwd": "/workspace/current", "type": "user", "isCompactSummary": True, "message": {"content": long_text}},
+            {"sessionId": "session-compact", "cwd": "/workspace/current", "type": "assistant", "message": {"content": [{"type": "text", "text": long_text}], "stop_reason": "end_turn"}},
+        ]
+        session_path.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--session", str(session_path), "--compact-json"],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        payload = json.loads(result.stdout)
+        self.assertNotIn("transcript", payload)
+        self.assertLessEqual(len(payload["continuation"]), 600)
+        self.assertLessEqual(len(payload["recent_context"]), 800)
+        self.assertLess(len(result.stdout), 3500)
+
 
 if __name__ == "__main__":
     unittest.main()

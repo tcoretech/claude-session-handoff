@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Added silent snapshot discovery and direct selection of the latest strong repository match.
+- Added a bounded compact handoff format that omits transcript paths and caps recovered context.
+- Reduced the default skill instructions and normal recovery output.
+
 ## 0.1.1
 
 - Distinguished human requests from system notifications, compaction records, sidechains, command

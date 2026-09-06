@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
         help="Write the discovered session payload to this JSON file for deterministic later resolution.",
     )
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Write the snapshot without emitting discovery data. Requires --snapshot-out.",
+    )
+    parser.add_argument(
         "--snapshot-in",
         help="Read a previously saved session payload instead of discovering sessions live.",
     )
@@ -468,6 +473,8 @@ def should_show_picker_preview(session: dict[str, object]) -> bool:
 
 def main() -> int:
     args = parse_args()
+    if args.quiet and not args.snapshot_out:
+        raise SystemExit("--quiet requires --snapshot-out.")
     current_cwd = Path(args.cwd).expanduser() if args.cwd else None
     if args.snapshot_in:
         payload = load_snapshot(Path(args.snapshot_in).expanduser())
@@ -477,6 +484,9 @@ def main() -> int:
 
     if args.snapshot_out:
         write_snapshot(Path(args.snapshot_out).expanduser(), payload)
+
+    if args.quiet:
+        return 0
 
     sessions = payload["sessions"]
 

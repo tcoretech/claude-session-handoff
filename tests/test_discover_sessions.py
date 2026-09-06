@@ -232,6 +232,21 @@ class DiscoverSessionsTests(unittest.TestCase):
         self.assertEqual(recovered["updated_source"], "mtime")
         self.assertIsNotNone(recovered["updated_at"])
 
+    def test_quiet_discovery_writes_snapshot_without_stdout(self) -> None:
+        snapshot = self.temp_dir / "quiet-snapshot.json"
+        result = self.run_script(
+            "--claude-projects-dir",
+            str(self.projects_dir),
+            "--cwd",
+            "/work/demo",
+            "--snapshot-out",
+            str(snapshot),
+            "--quiet",
+        )
+        self.assertEqual(result.stdout, "")
+        payload = json.loads(snapshot.read_text(encoding="utf-8"))
+        self.assertEqual(payload["sessions"][0]["session_id"], "session-alpha")
+
 
 if __name__ == "__main__":
     unittest.main()

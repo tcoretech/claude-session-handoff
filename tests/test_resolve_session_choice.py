@@ -183,6 +183,39 @@ class ResolveSessionChoiceTests(unittest.TestCase):
         payload = json.loads(summarize_result.stdout)
         self.assertEqual(payload["session_id"], "session-alpha")
 
+    def test_latest_repo_match_selects_strong_match_without_picker(self) -> None:
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "discover_sessions.py"),
+                "--claude-projects-dir",
+                str(self.projects_dir),
+                "--cwd",
+                "/work/demo",
+                "--snapshot-out",
+                str(self.snapshot_path),
+                "--quiet",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--snapshot",
+                str(self.snapshot_path),
+                "--latest-repo-match",
+                "--field",
+                "session_id",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "session-alpha")
+
 
 if __name__ == "__main__":
     unittest.main()

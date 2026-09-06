@@ -1,6 +1,6 @@
 {
   "name": "claude-session-handoff",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Recover ended Claude Code sessions into compact Codex handoffs from local transcripts.",
   "author": {
     "name": "tcoretech",
