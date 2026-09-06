@@ -1,5 +1,10 @@
 # Changelog
 
+## tcoretech distribution
+
+- Added tcoretech package, repository, and marketplace metadata.
+- Retained upstream history, implementation, and MIT attribution.
+
 ## 0.1.0
 
 - Initial public release candidate.

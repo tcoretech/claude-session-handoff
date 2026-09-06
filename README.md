@@ -2,6 +2,10 @@
 
 Recover a previous Claude Code session into a Codex handoff from local transcript files, without calling Claude in the normal path.
 
+This is the tcoretech distribution of
+[`fvhreimert/claude-session-handoff`](https://github.com/fvhreimert/claude-session-handoff).
+It preserves the upstream implementation and attribution while providing tcoretech-owned package metadata and releases.
+
 This is for the common failure mode where Claude Code hit a token limit, lost context, or the session ended, and you want Codex to continue from the local artifacts already on disk.
 
 ![claude-session-handoff demo](./demo/assets/demo.gif)
@@ -221,4 +225,4 @@ The repository includes:
 
 ## License
 
-MIT
+MIT. Copyright is retained for both the original author and tcoretech; see [LICENSE](LICENSE).

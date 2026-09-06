@@ -1,7 +1,7 @@
 {
-  "name": "claude-session-handoff-local",
+  "name": "tcoretech-local",
   "interface": {
-    "displayName": "Claude Session Handoff Local"
+    "displayName": "tcoretech Local"
   },
   "plugins": [
     {
