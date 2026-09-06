@@ -7,7 +7,7 @@ import json
 import os
 import platform
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -149,6 +149,29 @@ def is_substantive_user_text(text: str) -> bool:
     return True
 
 
+def is_task_notification(entry: dict) -> bool:
+    origin = entry.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") == "task-notification":
+        return True
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else ""
+    return isinstance(content, str) and content.lstrip().lower().startswith("<task-notification>")
+
+
+def effective_user_text(entry: dict) -> str:
+    if (
+        entry.get("type") != "user"
+        or entry.get("isSidechain")
+        or entry.get("isCompactSummary")
+        or is_task_notification(entry)
+    ):
+        return ""
+    text = parse_message_content(entry.get("message"))
+    if text.lower().startswith("[image:") and text.endswith("]"):
+        return ""
+    return text if is_substantive_user_text(text) else ""
+
+
 def has_local_command_markup(value: str | None) -> bool:
     if not value:
         return False
@@ -195,6 +218,7 @@ class SessionSummary:
     cwd: str | None
     updated_at: str | None
     updated_epoch: float
+    updated_source: str
     title: str
     title_source: str
     preview: str
@@ -241,13 +265,17 @@ def path_contains(parent: Path, child: Path) -> bool:
 
 def summarize_session(session_file: Path, current_cwd: Path | None) -> tuple[SessionSummary | None, str | None]:
     current_segment_first_user_text = ""
+    current_segment_latest_user_text = ""
+    current_segment_last_prompt = ""
     current_segment_custom_title = ""
+    current_segment_ai_title = ""
     current_segment_cwd = ""
     latest_timestamp: datetime | None = None
     latest_slug = ""
     session_id = session_file.stem
     parsed_entries = 0
     parse_errors = 0
+    previous_cwd = ""
 
     try:
         with session_file.open("r", encoding="utf-8") as handle:
@@ -264,10 +292,22 @@ def summarize_session(session_file: Path, current_cwd: Path | None) -> tuple[Ses
 
                 if entry.get("sessionId"):
                     session_id = entry["sessionId"]
-                if entry.get("cwd"):
-                    current_segment_cwd = entry["cwd"]
+                entry_cwd = entry.get("cwd") or previous_cwd
+                if entry_cwd and previous_cwd and entry_cwd != previous_cwd:
+                    current_segment_first_user_text = ""
+                    current_segment_latest_user_text = ""
+                    current_segment_last_prompt = ""
+                    current_segment_custom_title = ""
+                    current_segment_ai_title = ""
+                if entry_cwd:
+                    current_segment_cwd = entry_cwd
+                    previous_cwd = entry_cwd
                 if entry.get("customTitle"):
                     current_segment_custom_title = clean_text(entry["customTitle"])
+                if entry.get("type") == "ai-title" and entry.get("aiTitle"):
+                    current_segment_ai_title = clean_text(entry["aiTitle"])
+                if entry.get("type") == "last-prompt" and entry.get("lastPrompt"):
+                    current_segment_last_prompt = clean_text(entry["lastPrompt"])
                 if entry.get("slug"):
                     latest_slug = clean_text(entry["slug"])
                 dt = parse_iso(entry.get("timestamp"))
@@ -278,10 +318,17 @@ def summarize_session(session_file: Path, current_cwd: Path | None) -> tuple[Ses
                     text = parse_message_content(entry.get("message"))
                     if is_clear_command(text):
                         current_segment_first_user_text = ""
+                        current_segment_latest_user_text = ""
+                        current_segment_last_prompt = ""
                         current_segment_custom_title = ""
+                        current_segment_ai_title = ""
                         current_segment_cwd = entry.get("cwd") or ""
-                    elif not current_segment_first_user_text and is_substantive_user_text(text):
-                        current_segment_first_user_text = text
+                    else:
+                        user_text = effective_user_text(entry)
+                        if user_text:
+                            current_segment_latest_user_text = user_text
+                            if not current_segment_first_user_text:
+                                current_segment_first_user_text = user_text
     except OSError as exc:
         return None, str(exc)
 
@@ -291,12 +338,23 @@ def summarize_session(session_file: Path, current_cwd: Path | None) -> tuple[Ses
             reason += f" Encountered {parse_errors} JSON decode error(s)."
         return None, reason
 
-    updated_at = latest_timestamp.isoformat() if latest_timestamp else None
     updated_epoch = latest_timestamp.timestamp() if latest_timestamp else session_file.stat().st_mtime
+    updated_at = (
+        latest_timestamp.isoformat()
+        if latest_timestamp
+        else datetime.fromtimestamp(updated_epoch, timezone.utc).isoformat()
+    )
+    updated_source = "transcript" if latest_timestamp else "mtime"
 
     if current_segment_custom_title:
         title = current_segment_custom_title
         title_source = "custom_title"
+    elif current_segment_ai_title:
+        title = current_segment_ai_title
+        title_source = "ai_title"
+    elif current_segment_last_prompt:
+        title = truncate(current_segment_last_prompt, 80)
+        title_source = "last_prompt"
     elif current_segment_first_user_text:
         title = truncate(current_segment_first_user_text, 80)
         title_source = "prompt"
@@ -310,7 +368,8 @@ def summarize_session(session_file: Path, current_cwd: Path | None) -> tuple[Ses
         title = f"Session {session_id}"
         title_source = "session_id"
 
-    preview = truncate(current_segment_first_user_text, 140) if current_segment_first_user_text else title
+    preview_text = current_segment_last_prompt or current_segment_latest_user_text or current_segment_first_user_text
+    preview = truncate(preview_text, 140) if preview_text else title
     return SessionSummary(
         session_id=session_id,
         file_path=str(session_file),
@@ -318,6 +377,7 @@ def summarize_session(session_file: Path, current_cwd: Path | None) -> tuple[Ses
         cwd=current_segment_cwd or None,
         updated_at=updated_at,
         updated_epoch=updated_epoch,
+        updated_source=updated_source,
         title=title,
         title_source=title_source,
         preview=preview,
@@ -338,8 +398,22 @@ def discover_payload(current_cwd: Path | None, projects_dirs: Iterable[Path], li
         elif error:
             skipped_sessions.append(SkippedSession(file_path=str(session_file), error=error))
 
-    sessions.sort(key=lambda item: item.updated_epoch, reverse=True)
-    sessions = sessions[: max(limit, 0)]
+    rank = {"strong": 3, "related": 2, "different": 1, "unknown": 0}
+    sessions.sort(
+        key=lambda item: (
+            rank.get(item.repo_match, 0) if current_cwd is not None else 0,
+            item.updated_epoch,
+        ),
+        reverse=True,
+    )
+    deduplicated: list[SessionSummary] = []
+    seen_session_ids: set[str] = set()
+    for session in sessions:
+        if session.session_id in seen_session_ids:
+            continue
+        seen_session_ids.add(session.session_id)
+        deduplicated.append(session)
+    sessions = deduplicated[: max(limit, 0)]
 
     return {
         "platform": platform.system(),

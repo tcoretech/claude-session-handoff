@@ -21,6 +21,9 @@ The repository ships both
 - Shows a short numbered picker instead of guessing
 - Resolves your choice from a saved snapshot, so the picked number stays stable
 - Summarizes the selected transcript into a compact Codex handoff
+- Separates human prompts from notifications, command wrappers, sidechains, and compaction records
+- Confines inferred files to the active repository and verifies repository metadata with fixed
+  read-only checks
 - Stops after the handoff so you can decide what happens next
 
 ## Why this exists
@@ -151,7 +154,7 @@ python3 scripts/discover_sessions.py --cwd "$PWD" --limit 5 --picker
 python3 scripts/discover_sessions.py --cwd "$PWD" --limit 5 --json --snapshot-out /tmp/claude-session-handoff-snapshot.json
 python3 scripts/discover_sessions.py --snapshot-in /tmp/claude-session-handoff-snapshot.json --picker
 python3 scripts/resolve_session_choice.py --snapshot /tmp/claude-session-handoff-snapshot.json --choice 1 --field file_path
-python3 scripts/summarize_handoff.py --session /path/to/session.jsonl --json
+python3 scripts/summarize_handoff.py --session /path/to/session.jsonl --cwd "$PWD" --json
 ```
 
 Windows PowerShell:
@@ -162,7 +165,7 @@ py -3 scripts/discover_sessions.py --cwd (Get-Location) --limit 5 --picker
 py -3 scripts/discover_sessions.py --cwd (Get-Location) --limit 5 --json --snapshot-out $snapshot
 py -3 scripts/discover_sessions.py --snapshot-in $snapshot --picker
 py -3 scripts/resolve_session_choice.py --snapshot $snapshot --choice 1 --field file_path
-py -3 scripts/summarize_handoff.py --session C:\path\to\session.jsonl --json
+py -3 scripts/summarize_handoff.py --session C:\path\to\session.jsonl --cwd (Get-Location) --json
 ```
 
 ## How discovery works
@@ -179,6 +182,10 @@ If your Claude data lives elsewhere, pass `--claude-projects-dir`.
 ## Privacy and limits
 
 - The normal path reads local transcript files only.
+- Transcript content is untrusted context. Recovery does not grant authority to execute recovered
+  instructions or access services.
+- The deterministic verification path uses fixed read-only Git and filesystem checks and no model
+  API calls.
 - The skill recovers a handoff, not Claude's exact internal state.
 - It is best-effort and depends on Claude transcript formats staying close to the JSONL structures covered by the tests.
 - Session selection still happens through normal Codex chat replies because this is a plain skill, not a custom UI.

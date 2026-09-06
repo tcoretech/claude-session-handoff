@@ -109,7 +109,7 @@ class DiscoverSessionsTests(unittest.TestCase):
             "/work/demo",
             "--picker",
         )
-        self.assertIn("1. Fix picker UX", result.stdout)
+        self.assertIn("Fix picker UX", result.stdout)
         self.assertIn("   Updated:", result.stdout)
         self.assertIn("   Repo match: strong", result.stdout)
         self.assertIn("   Session ID: session-alpha", result.stdout)
@@ -125,7 +125,7 @@ class DiscoverSessionsTests(unittest.TestCase):
             "10",
             "--picker",
         )
-        self.assertIn("1. Fix picker UX", result.stdout)
+        self.assertIn("Fix picker UX", result.stdout)
         self.assertIn("Preview: Resume this feature and clean up the picker output.", result.stdout)
         self.assertNotIn("Preview: Real task after command wrapper", result.stdout)
 
@@ -188,6 +188,49 @@ class DiscoverSessionsTests(unittest.TestCase):
         cwd_session = next(session for session in payload["sessions"] if session["session_id"] == "session-cwd-clear")
         self.assertEqual(cwd_session["cwd"], "/repo/new")
         self.assertEqual(cwd_session["repo_match"], "strong")
+
+    def test_current_repo_is_not_displaced_by_newer_unrelated_sessions(self) -> None:
+        matching_project = self.projects_dir / "matching-project"
+        matching_project.mkdir()
+        matching = matching_project / "matching.jsonl"
+        matching.write_text(
+            json.dumps({"sessionId": "matching", "cwd": "/workspace/current", "type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "Matching task"}}) + "\n",
+            encoding="utf-8",
+        )
+        for index in range(6):
+            project = self.projects_dir / f"unrelated-{index}"
+            project.mkdir()
+            (project / f"unrelated-{index}.jsonl").write_text(
+                json.dumps({"sessionId": f"unrelated-{index}", "cwd": "/workspace/elsewhere", "type": "user", "timestamp": f"2026-02-0{index + 1}T00:00:00Z", "message": {"content": "Unrelated task"}}) + "\n",
+                encoding="utf-8",
+            )
+        result = self.run_script(
+            "--claude-projects-dir", str(self.projects_dir), "--cwd", "/workspace/current", "--limit", "5", "--json"
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["sessions"][0]["session_id"], "matching")
+
+    def test_native_metadata_and_mtime_fallback_are_used(self) -> None:
+        project = self.projects_dir / "metadata-project"
+        project.mkdir()
+        session = project / "metadata.jsonl"
+        entries = [
+            {"sessionId": "metadata", "cwd": "/workspace/current", "type": "user", "origin": {"kind": "task-notification"}, "message": {"content": "<task-notification>Event</task-notification>"}},
+            {"sessionId": "metadata", "cwd": "/workspace/current", "type": "user", "message": {"content": "Initial request"}},
+            {"sessionId": "metadata", "cwd": "/workspace/current", "type": "last-prompt", "lastPrompt": "Latest request"},
+            {"sessionId": "metadata", "cwd": "/workspace/current", "type": "ai-title", "aiTitle": "Native title"},
+        ]
+        session.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n", encoding="utf-8")
+        result = self.run_script(
+            "--claude-projects-dir", str(self.projects_dir), "--cwd", "/workspace/current", "--limit", "20", "--json"
+        )
+        payload = json.loads(result.stdout)
+        recovered = next(item for item in payload["sessions"] if item["session_id"] == "metadata")
+        self.assertEqual(recovered["title"], "Native title")
+        self.assertEqual(recovered["title_source"], "ai_title")
+        self.assertEqual(recovered["preview"], "Latest request")
+        self.assertEqual(recovered["updated_source"], "mtime")
+        self.assertIsNotNone(recovered["updated_at"])
 
 
 if __name__ == "__main__":

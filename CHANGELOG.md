@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1
+
+- Distinguished human requests from system notifications, compaction records, sidechains, command
+  wrappers, and image-only events.
+- Scoped recovery to the active repository segment and confined inferred files to that repository.
+- Added native title metadata, repository-aware discovery ranking, and timestamp fallback support.
+- Aggregated fragmented assistant responses and reported explicit completion and parse quality.
+- Added fixed read-only repository verification and untrusted-transcript provenance.
+
 ## tcoretech distribution
 
 - Added tcoretech package, repository, and marketplace metadata.

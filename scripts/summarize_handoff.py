@@ -4,460 +4,442 @@ from __future__ import annotations
 
 import argparse
 import json
+import ntpath
 import os
+import posixpath
 import re
+import subprocess
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-
-TRUSTED_FILE_PATH_KEYS = (
-    "file_path",
-    "target_file",
-    "source_file",
-    "filenames",
-)
-
-GENERIC_FILE_PATH_KEYS = ("path",)
-
+FILE_KEYS = {"file_path", "target_file", "source_file", "filenames"}
+PATH_KEYS = {"path"}
 COMMON_EXTENSIONLESS_FILES = {
-    "dockerfile",
-    "makefile",
-    "readme",
-    "license",
-    "gemfile",
-    "procfile",
-    "rakefile",
-    "justfile",
-    "cargo.lock",
+    "dockerfile", "makefile", "readme", "license", "gemfile", "procfile",
+    "rakefile", "justfile", "cargo.lock",
 }
-
-IGNORED_PATH_PARTS = (
-    "/.claude/plans/",
-    "/.claude/projects/",
-    "/.claude/sessions/",
-)
+IGNORED_PATH_PARTS = ("/.claude/plans/", "/.claude/projects/", "/.claude/sessions/")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Summarize a Claude session transcript into a Codex handoff."
-    )
-    parser.add_argument("--session", required=True, help="Path to a Claude session JSONL file.")
-    parser.add_argument(
-        "--tail",
-        type=int,
-        default=200,
-        help="How many transcript entries to inspect from the tail. Default: 200.",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit the handoff as JSON instead of a human-readable report.",
-    )
+    parser = argparse.ArgumentParser(description="Summarize a Claude transcript into a Codex handoff.")
+    parser.add_argument("--session", required=True)
+    parser.add_argument("--cwd", help="Repository expected by the current Codex session.")
+    parser.add_argument("--tail", type=int, default=200)
+    parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 
 
-def clean_text(value: str | None) -> str:
-    if not value:
+def clean_text(value: object) -> str:
+    if not isinstance(value, str) or not value:
         return ""
-    text = value.replace("\r", "\n")
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = " ".join(text.replace("\n", " ").split())
-    return text.strip()
-
-
-def has_local_command_markup(value: str | None) -> bool:
-    if not value:
-        return False
-    lowered = value.lower()
-    return "<command-name>" in lowered or "<local-command-caveat>" in lowered
-
-
-def parse_iso(timestamp: str | None):
-    if not timestamp:
-        return None
-    try:
-        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def truncate(text: str, limit: int = 280) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
-
-
-def parse_message_text(message: object, include_tool_results: bool = False) -> str:
-    if isinstance(message, dict):
-        content = message.get("content")
-        if isinstance(content, str):
-            return clean_text(content)
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                item_type = item.get("type")
-                if item_type == "text":
-                    raw_text = item.get("text")
-                    if has_local_command_markup(raw_text):
-                        continue
-                    parts.append(clean_text(raw_text))
-                elif include_tool_results and item_type == "tool_result":
-                    parts.append(clean_text(item.get("content")))
-            return clean_text(" ".join(part for part in parts if part))
-    return ""
+    return " ".join(re.sub(r"<[^>]+>", " ", value.replace("\r", "\n")).split()).strip()
 
 
 def raw_message_text(message: object) -> str:
     if not isinstance(message, dict):
         return ""
+    return message.get("content") if isinstance(message.get("content"), str) else ""
+
+
+def has_command_markup(value: object) -> bool:
+    lowered = value.lower() if isinstance(value, str) else ""
+    return "<command-name>" in lowered or "<local-command-caveat>" in lowered
+
+
+def parse_message_text(message: object) -> str:
+    if not isinstance(message, dict):
+        return ""
     content = message.get("content")
     if isinstance(content, str):
-        return content
-    return ""
-
-
-def extract_tool_names(message: object) -> list[str]:
-    if not isinstance(message, dict):
-        return []
-    content = message.get("content")
+        return clean_text(content)
     if not isinstance(content, list):
-        return []
-    tool_names: list[str] = []
-    for item in content:
-        if isinstance(item, dict) and item.get("type") == "tool_use" and isinstance(item.get("name"), str):
-            tool_names.append(item["name"])
-    return tool_names
-
-
-def extract_paths_from_obj(obj: object, found: dict[str, bool]) -> None:
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key == "filenames" and isinstance(value, list):
-                for item in value:
-                    if isinstance(item, str) and item.strip():
-                        found[item.strip()] = True
-            elif key in TRUSTED_FILE_PATH_KEYS and isinstance(value, str) and value.strip():
-                found[value.strip()] = True
-            elif key in GENERIC_FILE_PATH_KEYS and isinstance(value, str) and value.strip():
-                found.setdefault(value.strip(), False)
-            else:
-                extract_paths_from_obj(value, found)
-    elif isinstance(obj, list):
-        for item in obj:
-            extract_paths_from_obj(item, found)
+        return ""
+    parts = [
+        clean_text(item.get("text"))
+        for item in content
+        if isinstance(item, dict)
+        and item.get("type") == "text"
+        and not has_command_markup(item.get("text"))
+    ]
+    return clean_text(" ".join(filter(None, parts)))
 
 
 def is_clear_command(text: str) -> bool:
     return text.strip().lower() in {"clear", "/clear", "clear clear", "/clear clear"}
 
 
-def substantive_user_text(entry: dict) -> str:
-    if entry.get("type") != "user":
+def is_task_notification(entry: dict) -> bool:
+    origin = entry.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") == "task-notification":
+        return True
+    return raw_message_text(entry.get("message")).lstrip().lower().startswith("<task-notification>")
+
+
+def effective_user_text(entry: dict) -> str:
+    if (
+        entry.get("type") != "user"
+        or entry.get("isSidechain")
+        or entry.get("isCompactSummary")
+        or is_task_notification(entry)
+    ):
         return ""
-    raw_text = raw_message_text(entry.get("message"))
-    if "<local-command-caveat>" in raw_text.lower():
-        return ""
-    if "<command-name>" in raw_text.lower():
+    raw = raw_message_text(entry.get("message"))
+    if has_command_markup(raw):
         return ""
     text = parse_message_text(entry.get("message"))
-    lowered = text.lower()
-    if not text:
-        return ""
-    if "caveat: the messages below were generated by the user while running local commands" in lowered:
-        return ""
-    if is_clear_command(text) or text == "usage":
+    image_only = bool(re.fullmatch(r"(?:\[image:[^\]]*\]\s*)+", text, flags=re.IGNORECASE))
+    if not text or is_clear_command(text) or text.lower() == "usage" or image_only:
         return ""
     return text
 
 
-def assistant_text(entry: dict) -> str:
-    if entry.get("type") != "assistant":
-        return ""
-    return parse_message_text(entry.get("message"))
+def parse_iso(value: object):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
-def detect_path_style(path_text: str) -> str:
-    if re.match(r"^[A-Za-z]:[\\/]", path_text):
-        return "windows"
-    if path_text.startswith("\\\\"):
-        return "windows"
-    if "\\" in path_text and "/" not in path_text:
-        return "windows"
-    return "posix"
+def truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def build_pure_path(path_text: str, style: str):
-    if style == "windows":
-        return PureWindowsPath(path_text)
-    return PurePosixPath(path_text)
+def path_style(value: str) -> str:
+    windows = re.match(r"^[A-Za-z]:[\\/]", value) or value.startswith("\\\\")
+    return "windows" if windows or ("\\" in value and "/" not in value) else "posix"
 
 
-def render_pure_path(path_obj, style: str) -> str:
-    if style == "windows":
-        return str(path_obj)
-    return path_obj.as_posix()
+def is_absolute(value: str, style: str) -> bool:
+    return ntpath.isabs(value) if style == "windows" else posixpath.isabs(value)
 
 
-def host_path_style() -> str:
-    return "windows" if os.name == "nt" else "posix"
+def normalise_path(value: str, style: str) -> str:
+    return ntpath.normpath(value) if style == "windows" else posixpath.normpath(value)
 
 
-def normalized_parts(path_obj, style: str) -> tuple[str, ...]:
-    parts = path_obj.parts
-    if style == "windows":
-        return tuple(part.casefold() for part in parts)
-    return tuple(parts)
+def path_parts(value: str, style: str) -> tuple[str, ...]:
+    parsed = PureWindowsPath(value) if style == "windows" else PurePosixPath(value)
+    result = tuple(parsed.parts)
+    return tuple(item.casefold() for item in result) if style == "windows" else result
 
 
-def format_paths(paths: list[str], session_dir: str) -> str:
-    if not paths:
-        return "none inferred"
-    rendered: list[str] = []
-    for path in paths[:8]:
+def under(candidate: str, base: str, style: str) -> bool:
+    candidate_parts, base_parts = path_parts(candidate, style), path_parts(base, style)
+    return len(candidate_parts) >= len(base_parts) and candidate_parts[: len(base_parts)] == base_parts
+
+
+def looks_file_like(value: str) -> bool:
+    name = re.split(r"[\\/]", value.rstrip("/\\"))[-1]
+    return bool(name and ("." in name.strip(".") or name.lower() in COMMON_EXTENSIONLESS_FILES))
+
+
+def collect_paths(obj: object, found: dict[str, dict[str, int]], index: int) -> None:
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            values = value if key == "filenames" and isinstance(value, list) else [value]
+            if key in FILE_KEYS | PATH_KEYS:
+                for candidate in values:
+                    if isinstance(candidate, str) and candidate.strip():
+                        record = found.setdefault(
+                            candidate.strip(), {"count": 0, "last": index, "file_key": 0}
+                        )
+                        record["count"] += 1
+                        record["last"] = index
+                        record["file_key"] = max(record["file_key"], int(key in FILE_KEYS))
+            else:
+                collect_paths(value, found, index)
+    elif isinstance(obj, list):
+        for item in obj:
+            collect_paths(item, found, index)
+
+
+def candidate_paths(
+    entries: list[dict], repo_cwd: str, warnings: list[str], limit: int = 12
+) -> list[str]:
+    if not repo_cwd:
+        return []
+    found: dict[str, dict[str, int]] = {}
+    for index, entry in enumerate(entries):
+        collect_paths(entry.get("message"), found, index)
+        collect_paths(entry.get("toolUseResult"), found, index)
+
+    repo_style = path_style(repo_cwd)
+    base = normalise_path(repo_cwd, repo_style)
+    accepted: list[tuple[str, dict[str, int]]] = []
+    suppressed = 0
+    for raw, metadata in found.items():
+        raw_style = path_style(raw)
+        raw_absolute = is_absolute(raw, raw_style)
+        style = raw_style if raw_absolute else repo_style
+        if raw_absolute and style != repo_style:
+            suppressed += 1
+            continue
+        join = ntpath.join if style == "windows" else posixpath.join
+        candidate = normalise_path(raw if raw_absolute else join(base, raw), style)
+        matchable = candidate.replace("\\", "/").lower()
+        if not under(candidate, base, repo_style) or any(marker in matchable for marker in IGNORED_PATH_PARTS):
+            suppressed += 1
+            continue
+        if not metadata["file_key"] and not looks_file_like(candidate):
+            continue
+        host_style = "windows" if os.name == "nt" else "posix"
+        if style == host_style and Path(candidate).exists() and Path(candidate).is_dir():
+            continue
+        accepted.append((candidate, metadata))
+    if suppressed:
+        warnings.append(f"Suppressed {suppressed} path candidate(s) outside the active repository.")
+    accepted.sort(key=lambda item: (item[1]["last"], item[1]["count"]), reverse=True)
+    return [item[0] for item in accepted[:limit]]
+
+
+def assistant_groups(entries: list[dict]) -> list[dict]:
+    groups: OrderedDict[str, dict] = OrderedDict()
+    for index, entry in enumerate(entries):
+        if entry.get("type") != "assistant" or entry.get("isSidechain"):
+            continue
+        message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+        key = str(entry.get("requestId") or message.get("id") or f"entry-{index}")
+        group = groups.setdefault(
+            key, {"first": index, "last": index, "texts": [], "tools": [], "stop_reason": ""}
+        )
+        group["last"] = index
+        text = parse_message_text(message)
+        if text:
+            group["texts"].append(text)
+        content = message.get("content")
+        if isinstance(content, list):
+            group["tools"].extend(
+                item["name"]
+                for item in content
+                if isinstance(item, dict)
+                and item.get("type") == "tool_use"
+                and isinstance(item.get("name"), str)
+            )
+        if message.get("stop_reason"):
+            group["stop_reason"] = str(message["stop_reason"])
+    return list(groups.values())
+
+
+def git_output(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=True,
+    )
+    return result.stdout.rstrip("\r\n")
+
+
+def verify_repo(repo_cwd: str, likely_files: list[str], warnings: list[str]) -> dict[str, object]:
+    state: dict[str, object] = {"checked": False, "cwd": repo_cwd or None}
+    host_style = "windows" if os.name == "nt" else "posix"
+    if not repo_cwd or path_style(repo_cwd) != host_style:
+        return state
+    repo = Path(repo_cwd).expanduser()
+    if not repo.is_dir():
+        warnings.append("The active transcript directory is not available locally.")
+        return state
+    try:
+        root = Path(git_output(repo, "rev-parse", "--show-toplevel"))
         try:
-            if is_absolute_path_text(path):
-                rendered.append(path)
-                continue
-            if not session_dir:
-                rendered.append(path)
-                continue
-            style = detect_path_style(session_dir)
-            resolved = build_pure_path(session_dir, style) / build_pure_path(path, style)
-            rendered.append(render_pure_path(resolved, style))
-        except (OSError, ValueError):
-            rendered.append(path)
-    return ", ".join(rendered)
-
-
-def is_under_base(candidate, base, style: str) -> bool:
-    base_parts = normalized_parts(base, style)
-    candidate_parts = normalized_parts(candidate, style)
-    if len(base_parts) > len(candidate_parts):
-        return False
-    return candidate_parts[: len(base_parts)] == base_parts
-
-
-def looks_file_like(path_text: str) -> bool:
-    name = re.split(r"[\\/]", path_text.rstrip("/\\"))[-1].strip()
-    if not name or name in {".", ".."}:
-        return False
-    if "." in name.strip("."):
-        return True
-    if name.lower() in COMMON_EXTENSIONLESS_FILES:
-        return True
-    return False
-
-
-def is_absolute_path_text(path_text: str) -> bool:
-    if re.match(r"^[A-Za-z]:[\\/]", path_text):
-        return True
-    if path_text.startswith("\\\\"):
-        return True
-    return Path(path_text).is_absolute()
-
-
-def normalize_candidate_paths(paths: dict[str, bool], repo_cwd: str) -> list[str]:
-    repo_style = detect_path_style(repo_cwd) if repo_cwd else None
-    repo_base = build_pure_path(repo_cwd, repo_style) if repo_cwd else None
-    normalized: list[str] = []
-    for raw_path, trusted in sorted(paths.items()):
-        raw_is_absolute = is_absolute_path_text(raw_path)
-        raw_style = detect_path_style(raw_path) if ("\\" in raw_path or raw_is_absolute) else repo_style or host_path_style()
-        raw_candidate = build_pure_path(raw_path, raw_style)
-        candidate = raw_candidate
-        candidate_style = raw_style
-        if not raw_is_absolute and repo_base is not None:
-            candidate = repo_base / build_pure_path(raw_path, repo_style)
-            candidate_style = repo_style
-
-        expanded = render_pure_path(candidate if repo_base is not None or raw_is_absolute else raw_candidate, candidate_style)
-        matchable = path_match_text(expanded)
-        if any(part in matchable for part in IGNORED_PATH_PARTS):
-            continue
-        if expanded.endswith(("/", "\\")):
-            continue
-        if re.split(r"[\\/]", expanded.rstrip("/\\"))[-1] in {"", ".", ".."}:
-            continue
-        if not trusted:
-            if repo_base is None:
-                continue
-            if not raw_is_absolute:
-                candidate = repo_base / build_pure_path(raw_path, repo_style)
-                candidate_style = repo_style
-            if not is_under_base(candidate, repo_base, repo_style):
-                continue
-            if not looks_file_like(render_pure_path(candidate, candidate_style)):
-                continue
-        if candidate_style == host_path_style():
-            concrete = Path(render_pure_path(candidate, candidate_style)).expanduser()
-            if concrete.exists() and concrete.is_dir():
-                continue
-        normalized.append(expanded)
-    return normalized
-
-
-def path_match_text(path_text: str) -> str:
-    return path_text.replace("\\", "/").lower()
+            branch = git_output(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+        except subprocess.CalledProcessError:
+            branch = ""
+        head = git_output(root, "rev-parse", "HEAD")
+        status = git_output(root, "status", "--porcelain=v1", "--untracked-files=all")
+    except (OSError, subprocess.SubprocessError):
+        warnings.append("Repository metadata could not be verified with fixed read-only Git checks.")
+        return state
+    changed = [line[3:] for line in status.splitlines() if len(line) > 3]
+    return {
+        "checked": True,
+        "root": str(root),
+        "branch": branch or None,
+        "head": head,
+        "clean": not bool(status),
+        "changed_paths": changed,
+        "likely_file_exists": {value: Path(value).exists() for value in likely_files},
+    }
 
 
 def main() -> int:
     args = parse_args()
     session_path = Path(args.session).expanduser()
     entries: list[dict] = []
-    session_title = ""
-
+    parse_errors = 0
     try:
-        with session_path.open("r", encoding="utf-8") as handle:
-            for raw_line in handle:
-                raw_line = raw_line.strip()
-                if not raw_line:
-                    continue
-                try:
-                    entries.append(json.loads(raw_line))
-                except json.JSONDecodeError:
-                    continue
+        for raw_line in session_path.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            try:
+                value = json.loads(raw_line)
+                if isinstance(value, dict):
+                    entries.append(value)
+            except json.JSONDecodeError:
+                parse_errors += 1
     except OSError as exc:
         raise SystemExit(f"Could not read Claude session file {session_path}: {exc}") from exc
-
     if not entries:
         raise SystemExit(f"No parseable transcript entries found in {session_path}")
 
     session_id = session_path.stem
-    current_segment_title = ""
-    current_segment_cwd = ""
-    objective = ""
-    latest_timestamp = ""
-    latest_timestamp_dt = None
-    touched_paths: dict[str, bool] = {}
-    parse_errors = 0
-
+    latest_dt, latest_raw = None, None
+    final_cwd = ""
     for entry in entries:
-        if entry.get("sessionId"):
-            session_id = entry["sessionId"]
-        if entry.get("customTitle"):
-            current_segment_title = clean_text(entry["customTitle"])
-        if entry.get("cwd"):
-            current_segment_cwd = entry["cwd"]
-        entry_timestamp = entry.get("timestamp")
-        if entry_timestamp:
-            parsed_timestamp = parse_iso(entry_timestamp)
-            if parsed_timestamp is not None:
-                if latest_timestamp_dt is None or parsed_timestamp > latest_timestamp_dt:
-                    latest_timestamp_dt = parsed_timestamp
-                    latest_timestamp = entry_timestamp
-            elif not latest_timestamp:
-                latest_timestamp = entry_timestamp
-        parsed_user_text = parse_message_text(entry.get("message"))
-        text = substantive_user_text(entry)
-        if entry.get("type") == "user" and is_clear_command(parsed_user_text):
-            objective = ""
-            current_segment_title = ""
-            current_segment_cwd = entry.get("cwd") or ""
-        elif not objective and text:
-            objective = truncate(text, 400)
-        extract_paths_from_obj(entry.get("message"), touched_paths)
-        extract_paths_from_obj(entry.get("toolUseResult"), touched_paths)
+        session_id = str(entry.get("sessionId") or session_id)
+        final_cwd = str(entry.get("cwd") or final_cwd)
+        parsed = parse_iso(entry.get("timestamp"))
+        if parsed and (latest_dt is None or parsed > latest_dt):
+            latest_dt, latest_raw = parsed, entry.get("timestamp")
 
-    with session_path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            raw_line = raw_line.strip()
-            if not raw_line:
-                continue
-            try:
-                json.loads(raw_line)
-            except json.JSONDecodeError:
-                parse_errors += 1
+    segment_start, previous_cwd = 0, ""
+    for index, entry in enumerate(entries):
+        cwd = str(entry.get("cwd") or previous_cwd)
+        if final_cwd and cwd == final_cwd and previous_cwd and previous_cwd != final_cwd:
+            segment_start = index
+        if entry.get("type") == "user" and is_clear_command(parse_message_text(entry.get("message"))):
+            segment_start = index + 1
+        previous_cwd = cwd
+    segment = [entry for entry in entries[segment_start:] if not entry.get("isSidechain")]
 
-    tail_entries = entries[-max(args.tail, 1) :]
-    recent_user = ""
-    latest_assistant_text = ""
-    latest_assistant_tools: list[str] = []
-    latest_assistant_stop_reason = ""
-    open_thread = ""
-    saw_latest_assistant = False
+    prompts = [
+        (index, text)
+        for index, entry in enumerate(segment)
+        if (text := effective_user_text(entry))
+    ]
+    objective = prompts[0][1] if prompts else ""
+    current_request = prompts[-1][1] if prompts else ""
+    compact_summaries = [
+        text
+        for entry in segment
+        if entry.get("isCompactSummary")
+        and (text := parse_message_text(entry.get("message")))
+    ]
+    custom_titles = [
+        clean_text(entry.get("customTitle")) for entry in segment if entry.get("customTitle")
+    ]
+    ai_titles = [
+        clean_text(entry.get("aiTitle"))
+        for entry in segment
+        if entry.get("type") == "ai-title" and entry.get("aiTitle")
+    ]
+    title = (
+        custom_titles[-1]
+        if custom_titles
+        else ai_titles[-1]
+        if ai_titles
+        else objective
+    ) or f"Session {session_id}"
 
-    for entry in reversed(tail_entries):
-        if entry.get("type") == "assistant" and not saw_latest_assistant:
-            message = entry.get("message")
-            if isinstance(message, dict):
-                latest_assistant_stop_reason = str(message.get("stop_reason") or "")
-                latest_assistant_tools = extract_tool_names(message)
-            latest_assistant_text = truncate(assistant_text(entry), 500) if assistant_text(entry) else ""
-            saw_latest_assistant = True
-        if not recent_user:
-            text = substantive_user_text(entry)
-            if text:
-                recent_user = truncate(text, 500)
-
-    if latest_assistant_stop_reason == "tool_use":
+    tail_offset = max(0, len(segment) - max(args.tail, 1))
+    groups = assistant_groups(segment[tail_offset:])
+    latest_group = groups[-1] if groups else None
+    prompt_index = prompts[-1][0] if prompts else -1
+    assistant_after_prompt = bool(
+        latest_group and latest_group["last"] + tail_offset > prompt_index
+    )
+    if assistant_after_prompt and latest_group["stop_reason"] == "end_turn":
+        completion_state = "responded"
+        open_thread = "No unresolved action was inferred from the transcript; verify against repository state."
+    elif assistant_after_prompt and latest_group["stop_reason"] == "tool_use":
+        completion_state = "in_progress"
         open_thread = "Claude ended while preparing or awaiting a tool-driven step."
+    elif current_request and not assistant_after_prompt:
+        completion_state = "awaiting_response"
+        open_thread = "The current request has no later assistant response in the recovered segment."
     else:
-        if recent_user:
-            open_thread = f"Most recent user ask: {truncate(recent_user, 220)}"
-        elif latest_assistant_text:
-            open_thread = "Session appears to have ended after the last assistant reply."
-        else:
-            open_thread = "No clear unresolved thread could be inferred from the transcript tail."
-
-    title = current_segment_title or objective or f"Session {session_id}"
-
-    recent_context_parts: list[str] = []
-    if recent_user:
-        recent_context_parts.append(f"Latest user context: {recent_user}")
-    if latest_assistant_text:
-        recent_context_parts.append(f"Latest assistant output: {latest_assistant_text}")
-    elif latest_assistant_tools:
-        recent_context_parts.append(
-            f"Latest assistant activity: prepared tool calls to {', '.join(latest_assistant_tools)}."
+        completion_state = "unknown"
+        open_thread = (
+            f"Most recent user ask: {truncate(current_request, 220)}"
+            if current_request
+            else "No unresolved action could be inferred reliably."
         )
-    recent_context = "\n".join(recent_context_parts) if recent_context_parts else "No recent conversational context could be extracted."
 
+    warnings: list[str] = []
+    if any(is_task_notification(entry) for entry in segment):
+        warnings.append("Ignored system-generated task notification events.")
+    if compact_summaries:
+        warnings.append("A compaction summary is present and is reported separately from human prompts.")
+    if segment_start:
+        warnings.append("Earlier task or repository context was excluded from the active segment.")
+    likely_files = candidate_paths(segment, final_cwd, warnings)
+    checked_cwd = args.cwd or final_cwd
+    repo_state = verify_repo(checked_cwd, likely_files, warnings)
+
+    repo_match = "unknown"
+    if args.cwd and final_cwd and path_style(args.cwd) == path_style(final_cwd):
+        style = path_style(args.cwd)
+        repo_match = (
+            "strong"
+            if normalise_path(args.cwd, style) == normalise_path(final_cwd, style)
+            else "different"
+        )
+
+    recent_parts = []
+    if current_request:
+        recent_parts.append(f"Latest user context: {truncate(current_request, 800)}")
+    if latest_group:
+        assistant_output = " ".join(latest_group["texts"])
+        if assistant_output:
+            recent_parts.append(f"Latest assistant output: {truncate(assistant_output, 1600)}")
+        if latest_group["tools"]:
+            names = ", ".join(dict.fromkeys(latest_group["tools"]))
+            recent_parts.append(f"Latest assistant activity: prepared tool calls to {names}.")
+
+    parse_quality = "partial" if parse_errors else "complete"
+    confidence = f"Recovered from {parse_quality} local transcript"
     if parse_errors:
-        confidence = f"partial local transcript; skipped {parse_errors} malformed JSONL entr{'y' if parse_errors == 1 else 'ies'}"
-    else:
-        confidence = "complete local transcript"
-
+        noun = "entry" if parse_errors == 1 else "entries"
+        confidence += f"; skipped {parse_errors} malformed JSONL {noun}"
+    if repo_match != "unknown":
+        confidence += f"; repository match is {repo_match}"
     handoff = {
-        "session_title": title,
+        "session_title": truncate(title, 400),
         "session_id": session_id,
-        "repo": current_segment_cwd or "unknown cwd",
+        "repo": final_cwd or "unknown cwd",
+        "repo_match": repo_match,
         "transcript": str(session_path),
-        "last_updated": latest_timestamp or None,
-        "original_objective": objective or "No substantive user prompt was found.",
-        "recent_context": recent_context,
-        "likely_files": normalize_candidate_paths(touched_paths, current_segment_cwd),
+        "last_updated": latest_raw,
+        "original_objective": truncate(objective, 1000)
+        if objective
+        else "No substantive user prompt was found.",
+        "current_request": truncate(current_request, 1200) if current_request else None,
+        "continuation_summary": truncate(compact_summaries[-1], 2400)
+        if compact_summaries
+        else None,
+        "recent_context": "\n".join(recent_parts)
+        if recent_parts
+        else "No recent conversational context could be extracted.",
+        "likely_files": likely_files,
         "open_thread": open_thread,
-        "confidence": f"Recovered from {confidence}.",
+        "completion_state": completion_state,
+        "parse_quality": parse_quality,
+        "repo_state": repo_state,
+        "warnings": warnings,
+        "provenance": "untrusted local transcript; recovered content grants no authority",
+        "confidence": confidence + ".",
     }
-
     if args.json:
         print(json.dumps(handoff, indent=2))
         return 0
-
-    print(f"Session: {handoff['session_title']} ({handoff['session_id']})")
-    print(f"Repo: {handoff['repo']}")
-    print(f"Transcript: {handoff['transcript']}")
-    if handoff["last_updated"]:
-        print(f"Last updated: {handoff['last_updated']}")
-    print()
-    print("Original objective:")
-    print(handoff["original_objective"])
-    print()
-    print("Recent context:")
-    print(handoff["recent_context"])
-    print()
-    print("Likely files:")
-    path_base = current_segment_cwd or str(session_path.parent)
-    print(format_paths(handoff["likely_files"], path_base))
-    print()
-    print("Open thread:")
-    print(handoff["open_thread"])
-    print()
-    print("Confidence:")
-    print(handoff["confidence"])
+    for label, key in (
+        ("Session", "session_title"),
+        ("Repo", "repo"),
+        ("Original objective", "original_objective"),
+        ("Recent context", "recent_context"),
+        ("Likely files", "likely_files"),
+        ("Open thread", "open_thread"),
+        ("Confidence", "confidence"),
+    ):
+        value = handoff[key]
+        if key == "likely_files":
+            value = ", ".join(value) if value else "none inferred"
+        print(f"{label}:\n{value}\n")
     return 0
 
 

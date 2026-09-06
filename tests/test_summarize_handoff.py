@@ -35,7 +35,8 @@ class SummarizeHandoffTests(unittest.TestCase):
         self.assertEqual(payload["session_title"], "Fix picker UX")
         self.assertIn("Resume this feature", payload["original_objective"])
         self.assertIn("multiline format", payload["recent_context"])
-        self.assertEqual(payload["open_thread"], "Most recent user ask: Resume this feature and clean up the picker output.")
+        self.assertEqual(payload["completion_state"], "responded")
+        self.assertIn("verify against repository state", payload["open_thread"])
 
     def test_likely_files_keeps_extensionless_and_missing_paths(self) -> None:
         session_path = self.temp_dir / "session-paths.jsonl"
@@ -299,6 +300,156 @@ class SummarizeHandoffTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["repo"], "/repo/new")
         self.assertEqual(payload["session_title"], "New repo task")
+
+    def test_recovery_uses_active_repo_and_event_provenance(self) -> None:
+        session_path = self.temp_dir / "session-provenance.jsonl"
+        entries = [
+            {
+                "sessionId": "session-provenance",
+                "cwd": "/workspace/previous",
+                "type": "user",
+                "message": {"content": "Earlier request"},
+            },
+            {
+                "sessionId": "session-provenance",
+                "cwd": "/workspace/previous",
+                "type": "assistant",
+                "message": {"content": [], "stop_reason": "tool_use"},
+                "toolUseResult": {"file_path": "/workspace/previous/old.txt"},
+            },
+            {
+                "sessionId": "session-provenance",
+                "cwd": "/workspace/current",
+                "type": "user",
+                "promptSource": "system",
+                "message": {"content": "Review the current implementation"},
+            },
+            {
+                "sessionId": "session-provenance",
+                "cwd": "/workspace/current",
+                "type": "user",
+                "isCompactSummary": True,
+                "message": {"content": "Verified context for continuation"},
+            },
+            {
+                "sessionId": "session-provenance",
+                "cwd": "/workspace/current",
+                "type": "user",
+                "origin": {"kind": "task-notification"},
+                "message": {"content": "<task-notification>Background event</task-notification>"},
+            },
+            {
+                "sessionId": "session-provenance",
+                "cwd": "/workspace/current",
+                "type": "user",
+                "isSidechain": True,
+                "message": {"content": "Side task"},
+            },
+            {
+                "sessionId": "session-provenance",
+                "cwd": "/workspace/current",
+                "type": "assistant",
+                "requestId": "request-one",
+                "message": {
+                    "id": "message-one",
+                    "content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/workspace/current/src/app.py"}}],
+                    "stop_reason": "tool_use",
+                },
+                "toolUseResult": {"file_path": "/tmp/runtime.txt"},
+            },
+            {
+                "sessionId": "session-provenance",
+                "cwd": "/workspace/current",
+                "type": "assistant",
+                "requestId": "request-one",
+                "message": {
+                    "id": "message-one",
+                    "content": [{"type": "text", "text": "The review is ready."}],
+                    "stop_reason": "end_turn",
+                },
+            },
+            {
+                "sessionId": "session-provenance",
+                "cwd": "/workspace/current",
+                "type": "ai-title",
+                "aiTitle": "Review implementation",
+            },
+        ]
+        session_path.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--session", str(session_path), "--json"],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["original_objective"], "Review the current implementation")
+        self.assertEqual(payload["current_request"], "Review the current implementation")
+        self.assertEqual(payload["continuation_summary"], "Verified context for continuation")
+        self.assertEqual(payload["session_title"], "Review implementation")
+        self.assertEqual(payload["completion_state"], "responded")
+        self.assertIn("The review is ready.", payload["recent_context"])
+        self.assertIn("Read", payload["recent_context"])
+        self.assertEqual(payload["likely_files"], ["/workspace/current/src/app.py"])
+        self.assertNotIn("Earlier request", json.dumps(payload))
+        self.assertNotIn("Background event", json.dumps(payload))
+        self.assertIn("untrusted local transcript", payload["provenance"])
+
+    def test_clear_discards_paths_from_previous_task(self) -> None:
+        session_path = self.temp_dir / "session-clear-paths.jsonl"
+        entries = [
+            {"cwd": "/workspace/current", "type": "user", "message": {"content": "First task"}},
+            {"cwd": "/workspace/current", "type": "assistant", "message": {"content": [], "stop_reason": "tool_use"}, "toolUseResult": {"file_path": "/workspace/current/old.py"}},
+            {"cwd": "/workspace/current", "type": "user", "message": {"content": "/clear"}},
+            {"cwd": "/workspace/current", "type": "user", "message": {"content": "Second task"}},
+            {"cwd": "/workspace/current", "type": "assistant", "message": {"content": [], "stop_reason": "tool_use"}, "toolUseResult": {"file_path": "/workspace/current/new.py"}},
+        ]
+        session_path.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--session", str(session_path), "--json"],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["likely_files"], ["/workspace/current/new.py"])
+        self.assertEqual(payload["original_objective"], "Second task")
+
+    def test_repository_check_reports_git_and_file_evidence(self) -> None:
+        repo = self.temp_dir / "verified-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Fixture User"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"], check=True)
+        tracked = repo / "tracked.txt"
+        tracked.write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "Add fixture"], check=True)
+        tracked.write_text("changed\n", encoding="utf-8")
+        session_path = self.temp_dir / "session-repo-check.jsonl"
+        entries = [
+            {"cwd": str(repo), "type": "user", "message": {"content": "Check the change"}},
+            {
+                "cwd": str(repo),
+                "type": "assistant",
+                "message": {"content": [], "stop_reason": "tool_use"},
+                "toolUseResult": {"file_path": str(tracked)},
+            },
+        ]
+        session_path.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--session", str(session_path), "--cwd", str(repo), "--json"],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["repo_state"]["checked"])
+        self.assertFalse(payload["repo_state"]["clean"])
+        self.assertIn("tracked.txt", payload["repo_state"]["changed_paths"])
+        self.assertTrue(payload["repo_state"]["likely_file_exists"][str(tracked)])
+        self.assertEqual(payload["repo_match"], "strong")
 
 
 if __name__ == "__main__":
